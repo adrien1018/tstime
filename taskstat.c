@@ -1,3 +1,4 @@
+
 /*
  * taskstat.c
  *
@@ -162,6 +163,8 @@ static int get_family_id(int sd)
 			CTRL_ATTR_FAMILY_NAME, (void *)name,
 			strlen(TASKSTATS_GENL_NAME)+1);
 
+	if (rc < 0) return 0;
+
 	rep_len = recv(sd, &ans, sizeof(ans), 0);
 	if (ans.n.nlmsg_type == NLMSG_ERROR ||
 	    (rep_len < 0) || !NLMSG_OK((&ans.n), rep_len))
@@ -229,7 +232,7 @@ int ts_set_pid(ts_t *t, pid_t tid)
   return 0;
 }
 
-int ts_wait(ts_t *t, pid_t pid, int (*callback)(struct taskstats *) )
+int ts_wait(ts_t *t, pid_t pid, struct taskstats* ts_ret)
 {
   int nl_sd = t->nl_sd;
   __u16 id = t->id;
@@ -297,8 +300,10 @@ int ts_wait(ts_t *t, pid_t pid, int (*callback)(struct taskstats *) )
               case TASKSTATS_TYPE_STATS:
                 count++;
                 struct taskstats * ts = (struct taskstats *) NLA_DATA(na);
-                if (!pid || ts->ac_pid == pid)
-                  loop = callback(ts);
+                if (!pid || ts->ac_pid == pid) {
+                  loop = 0;
+                  memcpy(ts_ret, ts, sizeof(struct taskstats));
+                }
                 if (!loop)
                   goto done;
                 break;

@@ -2,12 +2,13 @@
 #define TOOLS_H
 
 #include <sys/types.h>
+#include <sched.h>
 
 struct taskstats;
 
-void pp_taskstats(char *message, size_t len, struct taskstats *t);
+void pp_taskstats(struct taskstats *t);
 void gen_cpumask(char *cpumask, size_t len);
-
+int parse_cpumask(const char* cpumask, cpu_set_t* cpuset);
 
 #define CHECK_ERR(a) \
   if (a<0) { \
@@ -23,9 +24,7 @@ void gen_cpumask(char *cpumask, size_t len);
   }
 
 #define LOG(stream, fmt, arg...) { \
-  if (!tab_out) { \
-    fprintf(stream, fmt, ##arg); \
-  } \
+  fprintf(stream, fmt, ##arg); \
 }
 
 #endif

@@ -6,13 +6,6 @@
 
 struct taskstats;
 
-extern int dbg;
-#define PRINTF(fmt, arg...) {			\
-	    if (dbg) {				\
-		printf(fmt, ##arg);		\
-	    }					\
-	}
-
 struct ts_t {
   int nl_sd;
   uint16_t id;
@@ -21,7 +14,6 @@ struct ts_t {
 };
 
 typedef struct ts_t ts_t;
-
 
 int ts_init(ts_t *t);
 int ts_set_cpus(ts_t *t, char *cpumask);

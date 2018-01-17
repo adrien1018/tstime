@@ -6,8 +6,8 @@
 
 struct taskstats;
 
-void pp_taskstats(struct taskstats *t);
-void gen_cpumask(char *cpumask, size_t len);
+void print_taskstats(int fd, struct taskstats* t);
+void gen_cpumask(char* cpumask, size_t len);
 int parse_cpumask(const char* cpumask, cpu_set_t* cpuset);
 
 #define CHECK_ERR(a) \

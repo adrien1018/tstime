@@ -1,15 +1,20 @@
-CFLAGS = -Wall -g -std=c99 -D_XOPEN_SOURCE -D_GNU_SOURCE
+CFLAGS = -Wall -std=c99 -D_XOPEN_SOURCE -D_GNU_SOURCE
+CLIBS = -lseccomp
 
-TEMP = tstime.o taskstat.o tools.o tstime
+OBJ_FILES = tstime.o taskstat.o tools.o
+TEMP = $(OBJ_FILES) tstime
 
 .PHONY: all
 all: tstime
 
-tstime: tstime.o taskstat.o tools.o
-	$(CC) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+tstime: $(OBJ_FILES)
+	$(CC) -o $@ $^ $(CFLAGS) $(CLIBS)
 
-tstime.o taskstat.o tstime.c taskstat.c: taskstat.h
-tstime.o tstime.c : tools.h
+%.o: %.c
+	$(CC) -c $(CFLAGS) $^ -o $@	
+
+tstime.c taskstat.c: taskstat.h
+tstime.c : tools.h
 
 .PHONY: clean
 clean:

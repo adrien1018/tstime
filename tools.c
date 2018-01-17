@@ -10,23 +10,33 @@
 
 #define MAX_CPUS 128
 
-void pp_taskstats(struct taskstats *t)
+void print_taskstats(int fd, struct taskstats* t)
 {
-  time_t btime = t->ac_btime;
-  printf("\npid: %u (%s) started: %s"
-      "\treal %7.3f s, user %7.3f s, sys %7.3fs\n"
-      "\trss %8llu kb, vm %8llu kb\n\n",
-      t->ac_pid, t->ac_comm, ctime(&btime),
-      t->ac_etime / 1000000.0,
-      t->ac_utime / 1000000.0,
-      t->ac_stime / 1000000.0,
-      (unsigned long long) t->hiwater_rss,
-      (unsigned long long) t->hiwater_vm
-
-      );
+  char buf[300];
+  int bytes = sprintf(
+    buf,
+    "%u\n%u\n%u\n%llu\n%llu\n%llu\n%llu\n%llu\n%llu\n"
+    "%llu\n%llu\n%llu\n%llu\n%llu\n%llu\n",
+    t->ac_pid,
+    t->ac_btime,
+    t->ac_exitcode,
+    t->cpu_run_real_total,
+    t->cpu_run_virtual_total,
+    t->ac_utime,
+    t->ac_stime,
+    t->hiwater_vm,
+    t->hiwater_rss,
+    t->virtmem,
+    t->coremem,
+    t->read_char,
+    t->write_char,
+    t->read_bytes,
+    t->write_bytes
+  );
+  write(fd, buf, bytes);
 }
 
-void gen_cpumask(char *cpumask, size_t len)
+void gen_cpumask(char* cpumask, size_t len)
 {
   int cpus = sysconf(_SC_NPROCESSORS_CONF) - 1;
   snprintf(cpumask, len, "0-%d", cpus);

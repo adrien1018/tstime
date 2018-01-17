@@ -25,38 +25,25 @@
 #include <sys/prctl.h>
 #include <seccomp.h>
 
-void child_exit(int i)
-{
-}
+const char options[] = "+i:o:m:v:t:f:p:u:";
+// input fd, output fd, cpu mask, VSS limit,
+// time limit, output limit, proc limits, user id
 
-void install_chld_handler()
-{
-  struct sigaction sa = { 0 };
-  sa.sa_handler = child_exit;
-  sa.sa_flags = SA_NOCLDSTOP;
-  int r = sigaction(SIGCHLD, &sa, 0); CHECK_ERR(r);
-}
+cpu_set_t cpumask;
+char cpumask_str[200] = "";
 
-int wait_for_child(pid_t pid)
-{
-  int code = 42;
-  int status;
-  pid_t r = waitpid(pid, &status, 0); CHECK_ERR(r);
-  return code;
-}
+int infd = 0, outfd = 1, uid = 0;
+unsigned int vs_lim = 65536, output_lim = 65536, time_lim = 2, proc_lim = 5;
+
+int* seccomp_list;
+int seccomp_list_size;
+
+int child_run(void* arg);
+void install_chld_handler();
+int wait_for_child(pid_t pid);
 
 int main(int argc, char** argv)
 {
-  const char options[] = "+i:o:m:v:t:f:p:u:";
-  // input fd, output fd, cpu mask, VSS limit,
-  // time limit, output limit, proc limits, user id
-
-  cpu_set_t cpumask;
-  char cpumask_str[200] = "";
-
-  int infd = 0, outfd = 1, uid = 0;
-  unsigned int vs_lim = 65536, output_lim = 65536, time_lim = 2, proc_lim = 5;
-
   int ret;
   opterr = 0;
   while ((ret = getopt(argc, argv, options)) != -1) {
@@ -83,8 +70,6 @@ int main(int argc, char** argv)
   }
   int start_arg = optind;
 
-  int* seccomp_list;
-  int seccomp_list_size;
   FILE* file = fdopen(infd, "r");
   if (!file) exit(1);
   fscanf(file, "%d", &seccomp_list_size);
@@ -102,44 +87,11 @@ int main(int argc, char** argv)
 
   struct taskstats ts;
 
-  pid_t pid = fork(); CHECK_ERR(pid);
-  if (!pid) {
-    r = prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
-    CHECK_ERR(r);
-    r = prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-    CHECK_ERR(r);
-    r = sched_setaffinity(getpid(), sizeof(cpu_set_t), &cpumask);
-    CHECK_ERR(r);
-    //r = close(infd);
-    //CHECK_ERR(r);
-    //r = close(outfd);
-    //CHECK_ERR(r);
-    //r = chroot("../");
-    //CHECK_ERR(r);
+  pid_t pid = clone(child_run, argv,
+                    SIGCHLD | CLONE_NEWIPC | CLONE_NEWNET |
+                    CLONE_NEWNS | CLONE_NEWPID,
+                    argv + start_arg);
 
-    setreuid(uid, 0); // set real user id first to use RLIMIT_NPROC
-
-    struct rlimit rlim;
-    rlim.rlim_cur = rlim.rlim_max = RLIM_INFINITY;
-    setrlimit(RLIMIT_STACK, &rlim);
-    //rlim.rlim_cur = rlim.rlim_max = proc_lim;
-    //setrlimit(RLIMIT_NPROC, &rlim);
-    rlim.rlim_cur = rlim.rlim_max = output_lim;
-    setrlimit(RLIMIT_FSIZE, &rlim);
-    rlim.rlim_cur = rlim.rlim_max = vs_lim << 10;
-    setrlimit(RLIMIT_AS, &rlim);
-
-    setuid(uid); // drop root privileges
-
-    scmp_filter_ctx ctx;
-    ctx = seccomp_init(SCMP_ACT_KILL);
-    for (int i = 0; i < seccomp_list_size; i++)
-      seccomp_rule_add(ctx, SCMP_ACT_ALLOW, seccomp_list[i], 0);
-    seccomp_load(ctx);
-
-    r = execvp(argv[start_arg], argv + start_arg);
-    CHECK_ERR(r);
-  }
   r = ts_wait(&t, pid, &ts); CHECK_ERR(r);
   r = wait_for_child(pid);
 
@@ -149,3 +101,64 @@ int main(int argc, char** argv)
   exit(r);
 }
 
+int child_run(void* arg)
+{
+  char** argv = arg;
+  int r;
+  r = prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
+  CHECK_ERR(r);
+  r = prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+  CHECK_ERR(r);
+  r = sched_setaffinity(getpid(), sizeof(cpu_set_t), &cpumask);
+  CHECK_ERR(r);
+  r = close(infd);
+  CHECK_ERR(r);
+  r = close(outfd);
+  CHECK_ERR(r);
+  //r = chroot("../");
+  //CHECK_ERR(r);
+
+  setreuid(uid, 0); // set real user id first to use RLIMIT_NPROC
+
+  struct rlimit rlim;
+  rlim.rlim_cur = rlim.rlim_max = RLIM_INFINITY;
+  setrlimit(RLIMIT_STACK, &rlim);
+  //rlim.rlim_cur = rlim.rlim_max = proc_lim;
+  //setrlimit(RLIMIT_NPROC, &rlim);
+  rlim.rlim_cur = rlim.rlim_max = output_lim;
+  setrlimit(RLIMIT_FSIZE, &rlim);
+  rlim.rlim_cur = rlim.rlim_max = vs_lim << 10;
+  setrlimit(RLIMIT_AS, &rlim);
+
+  setuid(uid); // drop root privileges
+
+  scmp_filter_ctx ctx;
+  ctx = seccomp_init(SCMP_ACT_KILL);
+  for (int i = 0; i < seccomp_list_size; i++)
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, seccomp_list[i], 0);
+  seccomp_load(ctx);
+
+  r = execvp(argv[0], argv);
+  CHECK_ERR(r);
+  return 0;
+}
+
+void child_exit(int i)
+{
+}
+
+void install_chld_handler()
+{
+  struct sigaction sa = { 0 };
+  sa.sa_handler = child_exit;
+  sa.sa_flags = SA_NOCLDSTOP;
+  int r = sigaction(SIGCHLD, &sa, 0); CHECK_ERR(r);
+}
+
+int wait_for_child(pid_t pid)
+{
+  int code = 42;
+  int status;
+  pid_t r = waitpid(pid, &status, 0); CHECK_ERR(r);
+  return code;
+}

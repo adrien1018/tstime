@@ -1,3 +1,4 @@
+CC = gcc
 CFLAGS = -Wall -std=c99 -D_XOPEN_SOURCE -D_GNU_SOURCE
 CLIBS = -lseccomp
 

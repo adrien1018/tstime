@@ -82,7 +82,6 @@ int main(int argc, char** argv)
 
   struct ts_t t;
   r = ts_init(&t); CHECK_ERR_SIMPLE(r);
-
   r = ts_set_cpus(&t, cpumask_str); CHECK_ERR(r);
 
   struct taskstats ts;
@@ -141,7 +140,7 @@ void child_run(char** argv)
   ctx = seccomp_init(SCMP_ACT_KILL);
   for (int i = 0; i < seccomp_list_size; i++)
     seccomp_rule_add(ctx, SCMP_ACT_ALLOW, seccomp_list[i], 0);
-  //seccomp_load(ctx);
+  seccomp_load(ctx);
 
   r = execvp(argv[0], argv);
   CHECK_ERR(r);
@@ -162,6 +161,9 @@ void sig_handler(int signo)
 
 int child_init(void* arg)
 {
+  close(infd);
+  close(outfd);
+
   struct sigaction act = {
     .sa_handler = sig_handler,
     .sa_flags = SA_RESTART
@@ -178,8 +180,6 @@ int child_init(void* arg)
   if (pid == 0) {
     close(pipes[0]);
     close(pipes[1]);
-    close(infd);
-    close(outfd);
     child_run(argv);
   }
   else {

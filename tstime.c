@@ -32,8 +32,8 @@ const char options[] = "+i:o:m:v:t:f:p:u:";
 cpu_set_t cpumask;
 char cpumask_str[200] = "";
 
-int infd = 0, outfd = 1, uid = 0;
-unsigned int vs_lim = 65536, output_lim = 65536, time_lim = 2, proc_lim = 5;
+int infd = STDIN_FILENO, outfd = STDOUT_FILENO, uid = 0;
+unsigned int vs_lim = 65536, output_lim = 65536, time_lim = 2, proc_lim = 1;
 
 int pipes[2];
 
@@ -42,7 +42,6 @@ int seccomp_list_size;
 /* 21 60 231 0 1 2 3 8 4 5 292 12 21 9 11 10 158 228 59 35 -10058 15 */
 int child_init(void* arg);
 pid_t get_a_child(pid_t pid);
-void install_chld_handler();
 
 int main(int argc, char** argv)
 {
@@ -84,7 +83,6 @@ int main(int argc, char** argv)
   struct ts_t t;
   r = ts_init(&t); CHECK_ERR_SIMPLE(r);
 
-  //install_chld_handler();
   r = ts_set_cpus(&t, cpumask_str); CHECK_ERR(r);
 
   struct taskstats ts;
@@ -98,27 +96,27 @@ int main(int argc, char** argv)
   pid_t pid = get_a_child(init_pid);
   r = ts_wait(&t, pid, &ts); CHECK_ERR(r);
 
-  char temp = 'a';
-  write(pipes[1], &temp, 1);
+  char buf[20] = " ";
+  write(pipes[1], buf, 1);
 
-  r = waitpid(init_pid, NULL, 0);
+  r = waitpid(init_pid, NULL, 0); CHECK_ERR(r);
 
   print_taskstats(outfd, &ts);
+  read(pipes[0], buf, 20);
+  puts(buf);
 
   ts_finish(&t);
-  exit(r);
+  return 0;
 }
 
 void child_run(char** argv)
 {
   int r;
-  r = prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
-  CHECK_ERR(r);
   r = prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
   CHECK_ERR(r);
   r = sched_setaffinity(getpid(), sizeof(cpu_set_t), &cpumask);
   CHECK_ERR(r);
-  //r = chroot("../");
+  //r = chroot("./");
   //CHECK_ERR(r);
 
   setreuid(uid, 0); // set real user id first to use RLIMIT_NPROC
@@ -133,6 +131,8 @@ void child_run(char** argv)
   setrlimit(RLIMIT_FSIZE, &rlim);
   rlim.rlim_cur = rlim.rlim_max = vs_lim << 10;
   setrlimit(RLIMIT_AS, &rlim);
+  rlim.rlim_cur = rlim.rlim_max = 0;
+  setrlimit(RLIMIT_CORE, &rlim);
 
   setgid(uid);
   setuid(uid); // drop root privileges
@@ -147,8 +147,32 @@ void child_run(char** argv)
   CHECK_ERR(r);
 }
 
+struct timeval end_time;
+
+void sig_handler(int signo)
+{
+  if (signo == SIGCHLD) {
+    gettimeofday(&end_time, NULL);
+  }
+  else {
+    write(pipes[1], "HLE", 4);
+    _exit(0); // this will kill child because of namespace
+  }
+}
+
 int child_init(void* arg)
 {
+  struct sigaction act = {
+    .sa_handler = sig_handler,
+    .sa_flags = SA_RESTART
+  };
+  sigemptyset(&act.sa_mask);
+  sigaddset(&act.sa_mask, SIGCHLD);
+  sigaddset(&act.sa_mask, SIGALRM);
+  sigaction(SIGCHLD, &act, NULL);
+  sigaction(SIGALRM, &act, NULL);
+  sigprocmask(SIG_SETMASK, &act.sa_mask, NULL);
+
   char** argv = arg;
   pid_t pid = fork(); CHECK_ERR(pid);
   if (pid == 0) {
@@ -159,9 +183,22 @@ int child_init(void* arg)
     child_run(argv);
   }
   else {
-    char tmp;
-    read(pipes[0], &tmp, 1);
+    struct timeval start_time;
+    gettimeofday(&start_time, NULL);
+    alarm(time_lim);
+
+    sigset_t wait_mask; sigemptyset(&wait_mask);
+    sigsuspend(&wait_mask);
+
+    char buf[20];
+    read(pipes[0], buf, 1);
     wait(NULL);
+
+    struct timeval duration;
+    timersub(&end_time, &start_time, &duration);
+    int bytes = sprintf(buf, "%lld", ((long long) duration.tv_sec) * 1000000
+                         + duration.tv_usec);
+    write(pipes[1], buf, bytes + 1);
   }
   return 0;
 }
@@ -188,16 +225,4 @@ pid_t get_a_child(pid_t pid)
   close(pipefd[0]); close(pipefd[1]);
   if (sscanf(buf, "%d", &result) != 1) return -1;
   return (pid_t)result;
-}
-
-void child_exit(int i)
-{
-}
-
-void install_chld_handler()
-{
-  struct sigaction sa = { 0 };
-  sa.sa_handler = child_exit;
-  sa.sa_flags = SA_NOCLDSTOP;
-  int r = sigaction(SIGCHLD, &sa, 0); CHECK_ERR(r);
 }

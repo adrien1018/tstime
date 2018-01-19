@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -std=c99 -D_XOPEN_SOURCE -D_GNU_SOURCE
+CFLAGS = -Wall -std=c99 -O2 -D_XOPEN_SOURCE -D_GNU_SOURCE
 CLIBS = -lseccomp
 
 OBJ_FILES = tstime.o taskstat.o tools.o

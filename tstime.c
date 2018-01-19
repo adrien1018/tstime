@@ -35,12 +35,14 @@ char cpumask_str[200] = "";
 int infd = 0, outfd = 1, uid = 0;
 unsigned int vs_lim = 65536, output_lim = 65536, time_lim = 2, proc_lim = 5;
 
+int pipes[2];
+
 int* seccomp_list;
 int seccomp_list_size;
-
-int child_run(void* arg);
+/* 21 60 231 0 1 2 3 8 4 5 292 12 21 9 11 10 158 228 59 35 -10058 15 */
+int child_init(void* arg);
+pid_t get_a_child(pid_t pid);
 void install_chld_handler();
-int wait_for_child(pid_t pid);
 
 int main(int argc, char** argv)
 {
@@ -87,13 +89,19 @@ int main(int argc, char** argv)
 
   struct taskstats ts;
 
-  pid_t pid = clone(child_run, argv,
-                    SIGCHLD | CLONE_NEWIPC | CLONE_NEWNET |
-                    CLONE_NEWNS | CLONE_NEWPID,
-                    argv + start_arg);
+  pipe(pipes);
+  pid_t init_pid = clone(child_init, argv,
+                         SIGCHLD | CLONE_NEWIPC | CLONE_NEWNET |
+                         CLONE_NEWNS | CLONE_NEWPID,
+                         argv + start_arg);
 
+  pid_t pid = get_a_child(init_pid);
   r = ts_wait(&t, pid, &ts); CHECK_ERR(r);
-  r = wait_for_child(pid);
+
+  char temp = 'a';
+  write(pipes[1], &temp, 1);
+
+  r = waitpid(init_pid, NULL, 0);
 
   print_taskstats(outfd, &ts);
 
@@ -101,9 +109,8 @@ int main(int argc, char** argv)
   exit(r);
 }
 
-int child_run(void* arg)
+void child_run(char** argv)
 {
-  char** argv = arg;
   int r;
   r = prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
   CHECK_ERR(r);
@@ -111,36 +118,76 @@ int child_run(void* arg)
   CHECK_ERR(r);
   r = sched_setaffinity(getpid(), sizeof(cpu_set_t), &cpumask);
   CHECK_ERR(r);
-  r = close(infd);
-  CHECK_ERR(r);
-  r = close(outfd);
-  CHECK_ERR(r);
   //r = chroot("../");
   //CHECK_ERR(r);
 
   setreuid(uid, 0); // set real user id first to use RLIMIT_NPROC
+  setregid(uid, 0);
 
   struct rlimit rlim;
   rlim.rlim_cur = rlim.rlim_max = RLIM_INFINITY;
   setrlimit(RLIMIT_STACK, &rlim);
-  //rlim.rlim_cur = rlim.rlim_max = proc_lim;
-  //setrlimit(RLIMIT_NPROC, &rlim);
+  rlim.rlim_cur = rlim.rlim_max = proc_lim;
+  setrlimit(RLIMIT_NPROC, &rlim);
   rlim.rlim_cur = rlim.rlim_max = output_lim;
   setrlimit(RLIMIT_FSIZE, &rlim);
   rlim.rlim_cur = rlim.rlim_max = vs_lim << 10;
   setrlimit(RLIMIT_AS, &rlim);
 
+  setgid(uid);
   setuid(uid); // drop root privileges
 
   scmp_filter_ctx ctx;
   ctx = seccomp_init(SCMP_ACT_KILL);
   for (int i = 0; i < seccomp_list_size; i++)
     seccomp_rule_add(ctx, SCMP_ACT_ALLOW, seccomp_list[i], 0);
-  seccomp_load(ctx);
+  //seccomp_load(ctx);
 
   r = execvp(argv[0], argv);
   CHECK_ERR(r);
+}
+
+int child_init(void* arg)
+{
+  char** argv = arg;
+  pid_t pid = fork(); CHECK_ERR(pid);
+  if (pid == 0) {
+    close(pipes[0]);
+    close(pipes[1]);
+    close(infd);
+    close(outfd);
+    child_run(argv);
+  }
+  else {
+    char tmp;
+    read(pipes[0], &tmp, 1);
+    wait(NULL);
+  }
   return 0;
+}
+
+pid_t get_a_child(pid_t pid)
+{
+  int pipefd[2];
+  pipe(pipefd);
+  pid_t chpid = fork();
+  if (chpid < 0) return chpid;
+  if (chpid == 0) {
+    char buf[15];
+    sprintf(buf, "%d", (int)pid);
+    dup2(pipefd[1], STDOUT_FILENO);
+    close(pipefd[0]); close(pipefd[1]);
+    execlp("pgrep", "pgrep", "-P", buf);
+    return -1;
+  }
+
+  waitpid(chpid, NULL, 0);
+  int result;
+  char buf[15];
+  read(pipefd[0], buf, 15);
+  close(pipefd[0]); close(pipefd[1]);
+  if (sscanf(buf, "%d", &result) != 1) return -1;
+  return (pid_t)result;
 }
 
 void child_exit(int i)
@@ -153,12 +200,4 @@ void install_chld_handler()
   sa.sa_handler = child_exit;
   sa.sa_flags = SA_NOCLDSTOP;
   int r = sigaction(SIGCHLD, &sa, 0); CHECK_ERR(r);
-}
-
-int wait_for_child(pid_t pid)
-{
-  int code = 42;
-  int status;
-  pid_t r = waitpid(pid, &status, 0); CHECK_ERR(r);
-  return code;
 }

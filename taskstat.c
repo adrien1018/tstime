@@ -154,7 +154,7 @@ static int get_family_id(int sd)
   struct nlattr* na;
   int rep_len;
 
-        char name[100];
+  char name[100];
   strcpy(name, TASKSTATS_GENL_NAME);
   rc = send_cmd(sd, GENL_ID_CTRL, getpid(), CTRL_CMD_GETFAMILY,
                 CTRL_ATTR_FAMILY_NAME, (void*)name,
@@ -163,6 +163,7 @@ static int get_family_id(int sd)
   if (rc < 0) return 0;
 
   rep_len = recv(sd, &ans, sizeof(ans), 0);
+
   if (ans.n.nlmsg_type == NLMSG_ERROR ||
       (rep_len < 0) || !NLMSG_OK((&ans.n), rep_len))
     return 0;

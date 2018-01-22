@@ -6,45 +6,75 @@
 #include "tools.h"
 
 #include <stdio.h>
+#include <assert.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
-#include <unistd.h>
+#include <inttypes.h>
+
+#include <errno.h>
+#include <fcntl.h>
+#include <sched.h>
 #include <signal.h>
-#include <sys/wait.h>
+#include <unistd.h>
+#include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/wait.h>
+#include <sys/prctl.h>
 #include <sys/types.h>
+#include <sys/socket.h>
 #include <sys/resource.h>
 
-#include <sched.h>
-#include <inttypes.h>
-#include <sys/socket.h>
 #include <linux/genetlink.h>
 #include <linux/taskstats.h>
 
-#include <sys/prctl.h>
 #include <seccomp.h>
 
-const char options[] = "+i:o:m:v:t:f:p:u:";
-// input fd, output fd, cpu mask, VSS limit,
-// time limit, output limit, proc limits, user id
+const char cg_memory_root[] = "/sys/fs/cgroup/memory/";
 
-cpu_set_t cpumask;
+const char options[] = "+i:o:m:v:r:t:f:p:u:n:";
+int infd;               // get seccomp whitelist
+int outfd;              // print statistics
+cpu_set_t cpumask;      // cpuset to run the command
 char cpumask_str[200] = "";
+rlim_t vs_lim;          // VSS limit, in bytes
+long long rs_lim;       // RSS limit, in bytes
+long long time_lim;     // time limit
+rlim_t output_lim;      // output limit, in bytes
+rlim_t proc_lim;        // process limit
+uid_t uid;              // uid to run command
+char cg_name[150] = ""; // name of cgroups
 
-int infd = STDIN_FILENO, outfd = STDOUT_FILENO, uid = 0;
-unsigned int vs_lim = 65536, output_lim = 65536, time_lim = 2, proc_lim = 1;
-
-int pipes[2];
+int pipes[2];           // sync between parent and init child
+char cg_path[250];
 
 int* seccomp_list;
 int seccomp_list_size;
 /* 21 60 231 0 1 2 3 8 4 5 292 12 21 9 11 10 158 228 59 35 -10058 15 */
+
 int child_init(void* arg);
 pid_t get_a_child(pid_t pid);
+void cg_init();
+void cg_addproc(pid_t pid);
+void cg_destroy();
+
+void input_ll(long long* val) {
+  sscanf(optarg, "%lld", val);
+  if (*val < -1) *val = -1;
+}
+void input_rlim(rlim_t* val) {
+  long long tmp;
+  sscanf(optarg, "%lld", &tmp);
+  *val = tmp < 0 ? RLIM_INFINITY : tmp;
+}
 
 int main(int argc, char** argv)
 {
+  if (geteuid()) exit(1); // must run as root
+
+  vs_lim = output_lim = proc_lim = RLIM_INFINITY;
+  rs_lim = time_lim = -1; // default: no limit
+
   int ret;
   opterr = 0;
   while ((ret = getopt(argc, argv, options)) != -1) {
@@ -56,21 +86,33 @@ int main(int argc, char** argv)
         strcpy(cpumask_str, optarg);
         break;
       }
-      case 'v': sscanf(optarg, "%u", &vs_lim); break;
-      case 't': sscanf(optarg, "%u", &time_lim); break;
-      case 'f': sscanf(optarg, "%u", &output_lim); break;
-      case 'p': sscanf(optarg, "%u", &proc_lim); break;
-      case 'u': sscanf(optarg, "%d", &uid); break;
+      case 'v': input_rlim(&vs_lim); break;
+      case 'r': input_ll(&rs_lim); break;
+      case 't': input_ll(&time_lim); break;
+      case 'f': input_rlim(&output_lim); break;
+      case 'p': input_rlim(&proc_lim); break;
+      case 'u': {
+        long long val;
+        input_ll(&val);
+        if (val <= 0) exit(1); // not allow to run as root
+        uid = val;
+        break;
+      }
+      case 'n': strncpy(cg_name, optarg, sizeof(cg_name) - 1); break;
       case '?': exit(1);
     }
   }
-  if (uid <= 0) exit(1);
+  if (uid <= 0 || infd < 0 || outfd < 0) exit(1);
+
   if (!*cpumask_str) {
-    gen_cpumask(cpumask_str, 200);
+    gen_cpumask(cpumask_str, sizeof(cpumask_str));
     parse_cpumask(cpumask_str, &cpumask);
   }
   int start_arg = optind;
 
+  if (rs_lim >= 0) cg_init();
+
+  // get seccomp whitelist
   FILE* file = fdopen(infd, "r");
   if (!file) exit(1);
   fscanf(file, "%d", &seccomp_list_size);
@@ -92,13 +134,16 @@ int main(int argc, char** argv)
                          CLONE_NEWNS | CLONE_NEWPID,
                          argv + start_arg);
 
+  if (rs_lim >= 0) cg_addproc(init_pid);
+  char buf[20] = " ";
+  write(pipes[1], buf, 1); // process added to cgroups
+
   pid_t pid = get_a_child(init_pid);
   r = ts_wait(&t, pid, &ts); CHECK_ERR(r);
-
-  char buf[20] = " ";
-  write(pipes[1], buf, 1);
+  write(pipes[1], buf, 1); // taskstats collection completed
 
   r = waitpid(init_pid, NULL, 0); CHECK_ERR(r);
+  cg_destroy();
 
   print_taskstats(outfd, &ts);
   read(pipes[0], buf, 20);
@@ -108,7 +153,7 @@ int main(int argc, char** argv)
   return 0;
 }
 
-void child_run(char** argv)
+void command_run(char** argv)
 {
   int r;
   r = prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
@@ -123,15 +168,15 @@ void child_run(char** argv)
 
   struct rlimit rlim;
   rlim.rlim_cur = rlim.rlim_max = RLIM_INFINITY;
-  setrlimit(RLIMIT_STACK, &rlim);
+  setrlimit(RLIMIT_STACK, &rlim); // no stack limit
   rlim.rlim_cur = rlim.rlim_max = proc_lim;
   setrlimit(RLIMIT_NPROC, &rlim);
   rlim.rlim_cur = rlim.rlim_max = output_lim;
   setrlimit(RLIMIT_FSIZE, &rlim);
-  rlim.rlim_cur = rlim.rlim_max = vs_lim << 10;
+  rlim.rlim_cur = rlim.rlim_max = vs_lim;
   setrlimit(RLIMIT_AS, &rlim);
   rlim.rlim_cur = rlim.rlim_max = 0;
-  setrlimit(RLIMIT_CORE, &rlim);
+  setrlimit(RLIMIT_CORE, &rlim); // not create core dump
 
   setgid(uid);
   setuid(uid); // drop root privileges
@@ -175,23 +220,25 @@ int child_init(void* arg)
   sigaction(SIGALRM, &act, NULL);
   sigprocmask(SIG_SETMASK, &act.sa_mask, NULL);
 
+  char buf[20];
+  read(pipes[0], buf, 1); // wait for cgroups adding
+
   char** argv = arg;
   pid_t pid = fork(); CHECK_ERR(pid);
   if (pid == 0) {
     close(pipes[0]);
     close(pipes[1]);
-    child_run(argv);
+    command_run(argv);
   }
   else {
     struct timeval start_time;
     gettimeofday(&start_time, NULL);
-    alarm(time_lim);
+    if (time_lim >= 0) alarm(time_lim);
 
     sigset_t wait_mask; sigemptyset(&wait_mask);
     sigsuspend(&wait_mask);
 
-    char buf[20];
-    read(pipes[0], buf, 1);
+    read(pipes[0], buf, 1); // wait for taskstats collecting
     wait(NULL);
 
     struct timeval duration;
@@ -225,4 +272,57 @@ pid_t get_a_child(pid_t pid)
   close(pipefd[0]); close(pipefd[1]);
   if (sscanf(buf, "%d", &result) != 1) return -1;
   return (pid_t)result;
+}
+
+void cg_init()
+{
+  int len;
+  while (1) {
+    if (!*cg_name) {
+      struct timeval now;
+      gettimeofday(&now, NULL);
+      len = sprintf(cg_path, "%scg_tstime_%ld%06d",
+                    cg_memory_root, (long)now.tv_sec, (int)now.tv_usec);
+    }
+    else {
+      len = sprintf(cg_path, "%scg_tstime_%s", cg_memory_root, cg_name);
+    }
+    if (mkdir(cg_path, 0755) < 0) {
+      if (errno != EEXIST) exit(1);
+      *cg_name = 0;
+    }
+    else break;
+  }
+
+  char buf[20];
+  int wbytes = sprintf(buf, "%lld\n", rs_lim);
+  strcpy(cg_path + len, "/memory.limit_in_bytes");
+  int fd = open(cg_path, O_WRONLY | O_TRUNC);
+  write(fd, buf, wbytes);
+  close(fd);
+  strcpy(cg_path + len, "/memory.memsw.limit_in_bytes");
+  fd = open(cg_path, O_WRONLY | O_TRUNC);
+  write(fd, buf, wbytes);
+  close(fd);
+
+  cg_path[len] = 0;
+}
+
+void cg_addproc(pid_t pid)
+{
+  char buf[20];
+  int wbytes = sprintf(buf, "%d\n", (int)pid);
+  int len = strlen(cg_path);
+  strcpy(cg_path + len, "/tasks");
+
+  int fd = open(cg_path, O_WRONLY | O_TRUNC);
+  write(fd, buf, wbytes);
+  close(fd);
+
+  cg_path[len] = 0;
+}
+
+void cg_destroy()
+{
+  while (rmdir(cg_path) < 0);
 }

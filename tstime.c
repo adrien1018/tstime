@@ -34,7 +34,7 @@
 
 const char cg_memory_root[] = "/sys/fs/cgroup/memory/";
 
-const char optstring[] = "+u:o:m:v:r:t:f:p:n:s:h";
+const char optstring[] = "+u:o:m:v:r:t:f:p:n:s:c:h";
 const struct option longopt[] = {
   {"uid",     1, NULL, 'u'},
   {"outfd",   1, NULL, 'o'},
@@ -46,21 +46,23 @@ const struct option longopt[] = {
   {"proc",    1, NULL, 'p'},
   {"name",    1, NULL, 'n'},
   {"syscall", 1, NULL, 's'},
+  {"chroot",  1, NULL, 'c'},
   {"help"   , 0, NULL, 'h'}
 };
 
-uid_t uid;                 // uid to run command
-int outfd;                 // print statistics
-cpu_set_t cpumask;         // cpuset to run the command
+uid_t uid;                  // uid to run command
+int outfd;                  // print statistics
+cpu_set_t cpumask;          // cpuset to run the command
 char cpumask_str[200] = "";
-rlim_t vs_lim;             // VSS limit (per proc), in bytes
-long long rs_lim;          // RSS limit (total), in bytes
-struct itimerval time_lim; // time limit
-rlim_t output_lim;         // output limit, in bytes
-rlim_t proc_lim;           // process limit
-char cg_name[150] = "";    // name of cgroups
+rlim_t vs_lim;              // VSS limit (per proc), in bytes
+long long rs_lim;           // RSS limit (total), in bytes
+struct itimerval time_lim;  // time limit
+rlim_t output_lim;          // output limit, in bytes
+rlim_t proc_lim;            // process limit
+char cg_name[150] = "";     // name of cgroups
+char chroot_path[250] = ""; // path to chroot
 
-int pipes[2];              // sync between parent and init child
+int pipes[2];               // sync between parent and init child
 char cg_path[250];
 
 int* seccomp_list;
@@ -174,10 +176,6 @@ void command_run(char** argv)
   CHECK_ERR(r);
   r = sched_setaffinity(getpid(), sizeof(cpu_set_t), &cpumask);
   CHECK_ERR(r);
-  r = chroot("./");
-  CHECK_ERR(r);
-  r = chdir("/");
-  CHECK_ERR(r);
 
   setreuid(uid, 0); // set real user id first to use RLIMIT_NPROC
   setregid(uid, 0);
@@ -191,6 +189,13 @@ void command_run(char** argv)
   setrlimit(RLIMIT_FSIZE, &rlim);
   rlim.rlim_cur = rlim.rlim_max = vs_lim;
   setrlimit(RLIMIT_AS, &rlim);
+
+  if (*chroot_path) {
+    r = chroot(chroot_path);
+    CHECK_ERR(r);
+    r = chdir("/");
+    CHECK_ERR(r);
+  }
 
   setgid(uid);
   setuid(uid); // drop root privileges
@@ -280,7 +285,9 @@ void display_help()
           "  -n STR, --name=STR\t\tSet the default name of created cgroup\n"
           "\t\t\t\t to \'cg_tstime_STR\'\n"
           "  -s LIST, --syscall=LIST\tBlock all system calls except LIST, format:\n"
-          "\t\t\t\t [# syscalls]:[syscall nums (comma delim)]\n");
+          "\t\t\t\t [# syscalls]:[syscall nums (comma delim)]\n"
+          "  -c ROOT, --chroot=ROOT\tRun command by chroot ROOT\n"
+          "\t\t\t\t (thus the executable path is relative to ROOT)\n");
 }
 
 void parse_args(int argc, char** argv)
@@ -334,6 +341,7 @@ void parse_args(int argc, char** argv)
         }
         break;
       }
+      case 'c': strncpy(chroot_path, optarg, sizeof(chroot_path) - 1); break;
       case 'h': display_help(); exit(0);
       case '?': display_help(); exit(1);
     }

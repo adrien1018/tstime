@@ -1,23 +1,21 @@
 CC = gcc
-CFLAGS = -Wall -std=c99 -O2 -D_XOPEN_SOURCE -D_GNU_SOURCE
+CFLAGS = -Wall -std=c99 -static -O2 -D_XOPEN_SOURCE -D_GNU_SOURCE
 CLIBS = -lseccomp
 
 OBJ_FILES = tstime.o taskstat.o tools.o
-TEMP = $(OBJ_FILES) tstime
+EXE = tstime
 
-.PHONY: all
-all: tstime
+.PHONY: all clean
+all: $(EXE)
 
-tstime: $(OBJ_FILES)
+$(EXE): $(OBJ_FILES)
 	$(CC) -o $@ $^ $(CFLAGS) $(CLIBS)
 
 %.o: %.c
 	$(CC) -c $(CFLAGS) $^ -o $@	
 
 tstime.c taskstat.c: taskstat.h
-tstime.c : tools.h
+tstime.c: tools.h
 
-.PHONY: clean
 clean:
-	rm -f $(TEMP)
-
+	rm -f $(EXE) $(OBJ_FILES)

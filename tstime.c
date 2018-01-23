@@ -5,6 +5,7 @@
 #include "taskstat.h"
 #include "tools.h"
 
+#include <time.h>
 #include <stdio.h>
 #include <assert.h>
 #include <limits.h>
@@ -28,21 +29,34 @@
 #include <linux/genetlink.h>
 #include <linux/taskstats.h>
 
+#include <getopt.h>
 #include <seccomp.h>
 
 const char cg_memory_root[] = "/sys/fs/cgroup/memory/";
 
-const char options[] = "+i:o:m:v:r:t:f:p:u:n:";
-int infd;               // get seccomp whitelist
+const char optstring[] = "+u:o:m:v:r:t:f:p:n:s:h";
+const struct option longopt[] = {
+  {"uid",     1, NULL, 'u'},
+  {"outfd",   1, NULL, 'o'},
+  {"cpuset",  1, NULL, 'm'},
+  {"vss",     1, NULL, 'v'},
+  {"rss",     1, NULL, 'r'},
+  {"time",    1, NULL, 't'},
+  {"output",  1, NULL, 'f'},
+  {"proc",    1, NULL, 'p'},
+  {"name",    1, NULL, 'n'},
+  {"syscall", 1, NULL, 's'},
+  {"help"   , 0, NULL, 'h'}
+};
+uid_t uid;              // uid to run command
 int outfd;              // print statistics
 cpu_set_t cpumask;      // cpuset to run the command
 char cpumask_str[200] = "";
-rlim_t vs_lim;          // VSS limit, in bytes
-long long rs_lim;       // RSS limit, in bytes
+rlim_t vs_lim;          // VSS limit (per proc), in bytes
+long long rs_lim;       // RSS limit (total), in bytes
 long long time_lim;     // time limit
 rlim_t output_lim;      // output limit, in bytes
 rlim_t proc_lim;        // process limit
-uid_t uid;              // uid to run command
 char cg_name[150] = ""; // name of cgroups
 
 int pipes[2];           // sync between parent and init child
@@ -50,8 +64,15 @@ char cg_path[250];
 
 int* seccomp_list;
 int seccomp_list_size;
-/* 21 60 231 0 1 2 3 8 4 5 292 12 21 9 11 10 158 228 59 35 -10058 15 */
+/* 20:60,231,0,1,2,3,8,4,5,292,12,21,9,11,10,158,228,59,35,15
+ * c: shared
+ * 17:60,231,0,1,8,5,16,12,21,89,63,9,158,201,228,59,35
+ * c: static
+ * 18:60,231,0,1,8,5,16,12,21,89,63,9,158,201,228,59,35,56 (clone)
+ * --uid=1007 --time=5 --cpuset=2 --proc=1
+ */
 
+void display_help();
 int child_init(void* arg);
 pid_t get_a_child(pid_t pid);
 void cg_init();
@@ -70,16 +91,30 @@ void input_rlim(rlim_t* val) {
 
 int main(int argc, char** argv)
 {
-  if (geteuid()) exit(1); // must run as root
+  if (geteuid()) {
+    fprintf(stderr, "Must run by root.\n");
+    exit(1);
+  }
+  if (argc < 3) {
+    display_help();
+    exit(1);
+  }
 
   vs_lim = output_lim = proc_lim = RLIM_INFINITY;
   rs_lim = time_lim = -1; // default: no limit
+  seccomp_list_size = -1;
 
   int ret;
-  opterr = 0;
-  while ((ret = getopt(argc, argv, options)) != -1) {
+  sscanf(argv[1], "%d", &ret);
+  if (ret <= 0) {
+    fprintf(stderr, "Invalid UID %s.\n", argv[1]);
+    exit(1); // not allow to run command as root
+  }
+  uid = ret;
+
+  opterr = 0; optind = 2;
+  while ((ret = getopt_long(argc, argv, optstring, longopt, NULL)) != -1) {
     switch (ret) {
-      case 'i': sscanf(optarg, "%d", &infd); break;
       case 'o': sscanf(optarg, "%d", &outfd); break;
       case 'm': {
         if (parse_cpumask(optarg, &cpumask) < 0) exit(1);
@@ -99,10 +134,25 @@ int main(int argc, char** argv)
         break;
       }
       case 'n': strncpy(cg_name, optarg, sizeof(cg_name) - 1); break;
-      case '?': exit(1);
+      case 's': {
+        int offset = 0, chars;
+        sscanf(optarg, "%d%*c%n", &seccomp_list_size, &offset);
+        if (seccomp_list_size < 0) exit(1);
+
+        seccomp_list = (int*) malloc(seccomp_list_size * sizeof(int));
+        for (int i = 0; i < seccomp_list_size; i++) {
+          sscanf(optarg + offset, "%d%*c%n", seccomp_list + i, &chars);
+          offset += chars;
+        }
+        break;
+      }
+      case 'h': display_help(); exit(0);
+      case '?': display_help(); exit(1);
     }
   }
-  if (uid <= 0 || infd < 0 || outfd < 0) exit(1);
+  if (uid <= 0 || outfd < 0) exit(1);
+
+  if (rs_lim >= 0) cg_init();
 
   if (!*cpumask_str) {
     gen_cpumask(cpumask_str, sizeof(cpumask_str));
@@ -110,18 +160,7 @@ int main(int argc, char** argv)
   }
   int start_arg = optind;
 
-  if (rs_lim >= 0) cg_init();
-
-  // get seccomp whitelist
-  FILE* file = fdopen(infd, "r");
-  if (!file) exit(1);
-  fscanf(file, "%d", &seccomp_list_size);
-  seccomp_list = (int*) malloc(seccomp_list_size * sizeof(int));
-  for (int i = 0; i < seccomp_list_size; i++)
-    fscanf(file, "%d", seccomp_list + i);
-
   int r = 0;
-
   struct ts_t t;
   r = ts_init(&t); CHECK_ERR_SIMPLE(r);
   r = ts_set_cpus(&t, cpumask_str); CHECK_ERR(r);
@@ -143,7 +182,7 @@ int main(int argc, char** argv)
   write(pipes[1], buf, 1); // taskstats collection completed
 
   r = waitpid(init_pid, NULL, 0); CHECK_ERR(r);
-  cg_destroy();
+  if (rs_lim >= 0) cg_destroy();
 
   print_taskstats(outfd, &ts);
   read(pipes[0], buf, 20);
@@ -153,15 +192,37 @@ int main(int argc, char** argv)
   return 0;
 }
 
+void display_help()
+{
+  fprintf(stderr,
+          "Usage: ./tstime UID [options] command [args...]\n\n"
+          "Options:\n"
+          "  -o FD, --output=FD\t\tOutput statistics to file descriptor FD\n"
+          "  -m CPUS, --cpuset=CPUS\tSet CPU affinity (in list format)\n"
+          "  -v SIZE, --vss=SIZE\t\tLimit VSS usage to SIZE bytes per process\n"
+          "  -r SIZE, --rss=SIZE\t\tLimit RSS usage to SIZE bytes in total\n"
+          "  -t TIME, --time=TIME\t\tLimit running time to TIME seconds\n"
+          "  -f SIZE, --output=SIZE\tSet file size limit to SIZE bytes\n"
+          "  -p NUM, --proc=NUM\t\tLimit the total process number of the user\n"
+          "  -n STR, --name=STR\t\tSet the default name of created cgroup\n"
+          "\t\t\t\t to \'cg_tstime_STR\'\n"
+          "  -s LIST, --syscall=LIST\tBlock all system calls except LIST, format:\n"
+          "\t\t\t\t [# syscalls]:[syscall nums (comma delim)]\n");
+}
+
 void command_run(char** argv)
 {
   int r;
+  r = prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+  CHECK_ERR(r);
   r = prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
   CHECK_ERR(r);
   r = sched_setaffinity(getpid(), sizeof(cpu_set_t), &cpumask);
   CHECK_ERR(r);
-  //r = chroot("./");
-  //CHECK_ERR(r);
+  r = chroot("./");
+  CHECK_ERR(r);
+  r = chdir("/");
+  CHECK_ERR(r);
 
   setreuid(uid, 0); // set real user id first to use RLIMIT_NPROC
   setregid(uid, 0);
@@ -175,17 +236,17 @@ void command_run(char** argv)
   setrlimit(RLIMIT_FSIZE, &rlim);
   rlim.rlim_cur = rlim.rlim_max = vs_lim;
   setrlimit(RLIMIT_AS, &rlim);
-  rlim.rlim_cur = rlim.rlim_max = 0;
-  setrlimit(RLIMIT_CORE, &rlim); // not create core dump
 
   setgid(uid);
   setuid(uid); // drop root privileges
 
-  scmp_filter_ctx ctx;
-  ctx = seccomp_init(SCMP_ACT_KILL);
-  for (int i = 0; i < seccomp_list_size; i++)
-    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, seccomp_list[i], 0);
-  seccomp_load(ctx);
+  if (seccomp_list_size != -1) {
+    scmp_filter_ctx ctx;
+    ctx = seccomp_init(SCMP_ACT_KILL);
+    for (int i = 0; i < seccomp_list_size; i++)
+      seccomp_rule_add(ctx, SCMP_ACT_ALLOW, seccomp_list[i], 0);
+    seccomp_load(ctx);
+  }
 
   r = execvp(argv[0], argv);
   CHECK_ERR(r);
@@ -199,14 +260,15 @@ void sig_handler(int signo)
     gettimeofday(&end_time, NULL);
   }
   else {
-    write(pipes[1], "HLE", 4);
-    _exit(0); // this will kill child because of namespace
+    write(pipes[1], "-1", 3);
+    _exit(0); // this will kill all childs because of namespace
   }
 }
 
 int child_init(void* arg)
 {
-  close(infd);
+  prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
+
   close(outfd);
 
   struct sigaction act = {
@@ -261,7 +323,7 @@ pid_t get_a_child(pid_t pid)
     sprintf(buf, "%d", (int)pid);
     dup2(pipefd[1], STDOUT_FILENO);
     close(pipefd[0]); close(pipefd[1]);
-    execlp("pgrep", "pgrep", "-P", buf);
+    execlp("pgrep", "pgrep", "-P", buf, NULL);
     return -1;
   }
 
@@ -324,5 +386,13 @@ void cg_addproc(pid_t pid)
 
 void cg_destroy()
 {
-  while (rmdir(cg_path) < 0);
+  struct timespec tenth = {
+    .tv_sec = 0,
+    .tv_nsec = 100000000l
+  };
+  for (int i = 0; i < 10; i++) {
+    if (rmdir(cg_path) == 0) return;
+    nanosleep(&tenth, NULL);
+  }
+  exit(1); // failed to remove cgroups
 }

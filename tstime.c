@@ -206,14 +206,9 @@ void command_run(char** argv)
   CHECK_ERR(r);
 }
 
-struct timeval end_time;
-
 void sig_handler(int signo)
 {
-  if (signo == SIGCHLD) {
-    gettimeofday(&end_time, NULL);
-  }
-  else {
+  if (signo == SIGALRM) {
     write(pipes[1], "-1", 3);
     _exit(0); // this will kill all children because of namespace
   }
@@ -247,8 +242,6 @@ int child_init(void* arg)
     command_run(argv);
   }
   else {
-    struct timeval start_time;
-    gettimeofday(&start_time, NULL);
     if (time_lim >= 0) alarm(time_lim);
 
     sigset_t wait_mask; sigemptyset(&wait_mask);
@@ -256,12 +249,6 @@ int child_init(void* arg)
 
     read(pipes[0], buf, 1); // wait for taskstats collecting
     wait(NULL);
-
-    struct timeval duration;
-    timersub(&end_time, &start_time, &duration);
-    int bytes = sprintf(buf, "%lld", ((long long) duration.tv_sec) * 1000000
-                         + duration.tv_usec);
-    write(pipes[1], buf, bytes + 1);
   }
   return 0;
 }
@@ -380,20 +367,16 @@ int main(int argc, char** argv)
                          argv + start_arg);
 
   if (rs_lim >= 0) cg_addproc(init_pid);
-  char buf[20] = " ";
-  write(pipes[1], buf, 1); // process added to cgroups
+  char tmpchar = ' ';
+  write(pipes[1], &tmpchar, 1); // process added to cgroups
 
   pid_t pid = get_a_child(init_pid);
   r = ts_wait(&t, pid, &ts); CHECK_ERR(r);
-  write(pipes[1], buf, 1); // taskstats collection completed
+  write(pipes[1], &tmpchar, 1); // taskstats collection completed
+  print_taskstats(outfd, &ts);
 
   r = waitpid(init_pid, NULL, 0); CHECK_ERR(r);
   if (rs_lim >= 0) cg_destroy();
-
-  print_taskstats(outfd, &ts);
-  read(pipes[0], buf, 20);
-  puts(buf);
-
   ts_finish(&t);
   return 0;
 }

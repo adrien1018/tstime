@@ -16,7 +16,7 @@ void print_taskstats(int fd, struct taskstats* t)
   int bytes = sprintf(
     buf,
     "%u\n%u\n%u\n%llu\n%llu\n%llu\n%llu\n%llu\n%llu\n"
-    "%llu\n%llu\n%llu\n%llu\n%llu\n%llu\n",
+    "%llu\n%llu\n%llu\n%llu\n%llu\n%llu\n%llu\n",
     t->ac_pid,
     t->ac_btime,
     t->ac_exitcode,
@@ -24,6 +24,7 @@ void print_taskstats(int fd, struct taskstats* t)
     t->cpu_run_virtual_total,
     t->ac_utime,
     t->ac_stime,
+    t->ac_etime,
     t->hiwater_vm,
     t->hiwater_rss,
     t->virtmem,

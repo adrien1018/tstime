@@ -49,18 +49,18 @@ const struct option longopt[] = {
   {"help"   , 0, NULL, 'h'}
 };
 
-uid_t uid;              // uid to run command
-int outfd;              // print statistics
-cpu_set_t cpumask;      // cpuset to run the command
+uid_t uid;                 // uid to run command
+int outfd;                 // print statistics
+cpu_set_t cpumask;         // cpuset to run the command
 char cpumask_str[200] = "";
-rlim_t vs_lim;          // VSS limit (per proc), in bytes
-long long rs_lim;       // RSS limit (total), in bytes
-long long time_lim;     // time limit
-rlim_t output_lim;      // output limit, in bytes
-rlim_t proc_lim;        // process limit
-char cg_name[150] = ""; // name of cgroups
+rlim_t vs_lim;             // VSS limit (per proc), in bytes
+long long rs_lim;          // RSS limit (total), in bytes
+struct itimerval time_lim; // time limit
+rlim_t output_lim;         // output limit, in bytes
+rlim_t proc_lim;           // process limit
+char cg_name[150] = "";    // name of cgroups
 
-int pipes[2];           // sync between parent and init child
+int pipes[2];              // sync between parent and init child
 char cg_path[250];
 
 int* seccomp_list;
@@ -88,9 +88,9 @@ void cg_init()
     else {
       len = sprintf(cg_path, "%scg_tstime_%s", cg_memory_root, cg_name);
     }
-    if (mkdir(cg_path, 0755) < 0) {
+    if (mkdir(cg_path, 0755) < 0) { // create group
       if (errno != EEXIST) exit(1);
-      *cg_name = 0;
+      *cg_name = 0; // if the name exists, use system time as name
     }
     else break;
   }
@@ -116,7 +116,7 @@ void cg_addproc(pid_t pid)
   int len = strlen(cg_path);
   strcpy(cg_path + len, "/tasks");
 
-  int fd = open(cg_path, O_WRONLY | O_TRUNC);
+  int fd = open(cg_path, O_WRONLY | O_APPEND);
   write(fd, buf, wbytes);
   close(fd);
 
@@ -131,7 +131,7 @@ void cg_destroy()
   };
   for (int i = 0; i < 10; i++) {
     if (rmdir(cg_path) == 0) return;
-    nanosleep(&tenth, NULL);
+    nanosleep(&tenth, NULL); // try again
   }
   exit(1); // failed to remove cgroups
 }
@@ -144,7 +144,7 @@ pid_t get_a_child(pid_t pid)
   pipe(pipefd);
   pid_t chpid = fork();
   if (chpid < 0) return chpid;
-  if (chpid == 0) {
+  if (chpid == 0) { // use pgrep to list child processes
     char buf[15];
     sprintf(buf, "%d", (int)pid);
     dup2(pipefd[1], STDOUT_FILENO);
@@ -153,13 +153,14 @@ pid_t get_a_child(pid_t pid)
     return -1;
   }
 
+  close(pipefd[1]); // close first or read will block
   waitpid(chpid, NULL, 0);
   int result;
   char buf[15];
   read(pipefd[0], buf, 15);
-  close(pipefd[0]); close(pipefd[1]);
+  close(pipefd[0]);
   if (sscanf(buf, "%d", &result) != 1) return -1;
-  return (pid_t)result;
+  return (pid_t)result; // return the first child returned by pgrep
 }
 
 // --- execution ---
@@ -209,7 +210,8 @@ void command_run(char** argv)
 void sig_handler(int signo)
 {
   if (signo == SIGALRM) {
-    write(pipes[1], "-1", 3);
+    char tmpchar; // still need to wait for parent to get pid
+    read(pipes[0], &tmpchar, 1);
     _exit(0); // this will kill all children because of namespace
   }
 }
@@ -220,10 +222,8 @@ int child_init(void* arg)
 
   close(outfd);
 
-  struct sigaction act = {
-    .sa_handler = sig_handler,
-    .sa_flags = SA_RESTART
-  };
+  struct sigaction act;
+  act.sa_handler = sig_handler;
   sigemptyset(&act.sa_mask);
   sigaddset(&act.sa_mask, SIGCHLD);
   sigaddset(&act.sa_mask, SIGALRM);
@@ -233,21 +233,20 @@ int child_init(void* arg)
 
   char buf[20];
   read(pipes[0], buf, 1); // wait for cgroups adding
+  if (!time_lim.it_interval.tv_sec) // start time limit
+    setitimer(ITIMER_REAL, &time_lim, NULL);
 
-  char** argv = arg;
   pid_t pid = fork(); CHECK_ERR(pid);
   if (pid == 0) {
     close(pipes[0]);
     close(pipes[1]);
-    command_run(argv);
+    command_run((char**) arg);
   }
   else {
-    if (time_lim >= 0) alarm(time_lim);
-
     sigset_t wait_mask; sigemptyset(&wait_mask);
     sigsuspend(&wait_mask);
 
-    read(pipes[0], buf, 1); // wait for taskstats collecting
+    read(pipes[0], buf, 1); // wait for parent to get pid
     wait(NULL);
   }
   return 0;
@@ -275,7 +274,7 @@ void display_help()
           "  -m CPUS, --cpuset=CPUS\tSet CPU affinity (in list format)\n"
           "  -v SIZE, --vss=SIZE\t\tLimit VSS usage to SIZE bytes per process\n"
           "  -r SIZE, --rss=SIZE\t\tLimit RSS usage to SIZE bytes in total\n"
-          "  -t TIME, --time=TIME\t\tLimit running time to TIME seconds\n"
+          "  -t TIME, --time=TIME\t\tLimit running time to TIME microseconds\n"
           "  -f SIZE, --output=SIZE\tSet file size limit to SIZE bytes\n"
           "  -p NUM, --proc=NUM\t\tLimit the total process number of the user\n"
           "  -n STR, --name=STR\t\tSet the default name of created cgroup\n"
@@ -310,7 +309,15 @@ void parse_args(int argc, char** argv)
       }
       case 'v': input_rlim(&vs_lim); break;
       case 'r': input_ll(&rs_lim); break;
-      case 't': input_ll(&time_lim); break;
+      case 't': {
+        long long val;
+        input_ll(&val);
+        if (val > 0) {
+          time_lim = (struct itimerval)
+            {{0, 0}, {val / 1000000, val % 1000000}};
+        }
+        break;
+      }
       case 'f': input_rlim(&output_lim); break;
       case 'p': input_rlim(&proc_lim); break;
       case 'u': sscanf(optarg, "%d", &ret); uid = ret; break;
@@ -340,8 +347,9 @@ int main(int argc, char** argv)
     fprintf(stderr, "Must run by root.\n");
     exit(1);
   }
+  // default: no limits
   vs_lim = output_lim = proc_lim = RLIM_INFINITY;
-  rs_lim = time_lim = -1; // default: no limit
+  rs_lim = time_lim.it_interval.tv_sec = -1;
   seccomp_list_size = -1;
 
   parse_args(argc, argv);
@@ -371,8 +379,8 @@ int main(int argc, char** argv)
   write(pipes[1], &tmpchar, 1); // process added to cgroups
 
   pid_t pid = get_a_child(init_pid);
+  write(pipes[1], &tmpchar, 1); // child pid get
   r = ts_wait(&t, pid, &ts); CHECK_ERR(r);
-  write(pipes[1], &tmpchar, 1); // taskstats collection completed
   print_taskstats(outfd, &ts);
 
   r = waitpid(init_pid, NULL, 0); CHECK_ERR(r);

@@ -227,7 +227,7 @@ int ts_set_pid(ts_t* t, pid_t tid)
   return 0;
 }
 
-int ts_wait(ts_t* t, pid_t pid, struct taskstats* ts_ret)
+int ts_wait(ts_t* t, pid_t ppid, struct taskstats* ts_ret)
 {
   int nl_sd = t->nl_sd;
   __u16 id = t->id;
@@ -274,7 +274,7 @@ int ts_wait(ts_t* t, pid_t pid, struct taskstats* ts_ret)
                 case TASKSTATS_TYPE_STATS:
                   count++;
                   struct taskstats* ts = (struct taskstats*) NLA_DATA(na);
-                  if (!pid || ts->ac_pid == pid) {
+                  if (!ppid || ts->ac_ppid == ppid) {
                     loop = 0;
                     memcpy(ts_ret, ts, sizeof(struct taskstats));
                   }

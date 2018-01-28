@@ -71,7 +71,7 @@ int seccomp_list_size;
  * c: shared
  * 17:60,231,0,1,8,5,16,12,21,89,63,9,158,201,228,59,35
  * c: static
- * 18:60,231,0,1,8,5,16,12,21,89,63,9,158,201,228,59,35,56 (clone)
+ * 56(clone) 2(open) 292(dup3)
  * --uid=1007 --time=5 --cpuset=2 --proc=1
  */
 
@@ -138,33 +138,6 @@ void cg_destroy()
   exit(1); // failed to remove cgroups
 }
 
-// --- getchild helper ---
-
-pid_t get_a_child(pid_t pid)
-{
-  int pipefd[2];
-  pipe(pipefd);
-  pid_t chpid = fork();
-  if (chpid < 0) return chpid;
-  if (chpid == 0) { // use pgrep to list child processes
-    char buf[15];
-    sprintf(buf, "%d", (int)pid);
-    dup2(pipefd[1], STDOUT_FILENO);
-    close(pipefd[0]); close(pipefd[1]);
-    execlp("pgrep", "pgrep", "-P", buf, NULL);
-    return -1;
-  }
-
-  close(pipefd[1]); // close first or read will block
-  waitpid(chpid, NULL, 0);
-  int result;
-  char buf[15];
-  read(pipefd[0], buf, 15);
-  close(pipefd[0]);
-  if (sscanf(buf, "%d", &result) != 1) return -1;
-  return (pid_t)result; // return the first child returned by pgrep
-}
-
 // --- execution ---
 
 void command_run(char** argv)
@@ -215,8 +188,6 @@ void command_run(char** argv)
 void sig_handler(int signo)
 {
   if (signo == SIGALRM) {
-    char tmpchar; // still need to wait for parent to get pid
-    read(pipes[0], &tmpchar, 1);
     _exit(0); // this will kill all children because of namespace
   }
 }
@@ -250,8 +221,6 @@ int child_init(void* arg)
   else {
     sigset_t wait_mask; sigemptyset(&wait_mask);
     sigsuspend(&wait_mask);
-
-    read(pipes[0], buf, 1); // wait for parent to get pid
     wait(NULL);
   }
   return 0;
@@ -386,9 +355,7 @@ int main(int argc, char** argv)
   char tmpchar = ' ';
   write(pipes[1], &tmpchar, 1); // process added to cgroups
 
-  pid_t pid = get_a_child(init_pid);
-  write(pipes[1], &tmpchar, 1); // child pid get
-  r = ts_wait(&t, pid, &ts); CHECK_ERR(r);
+  r = ts_wait(&t, init_pid, &ts); CHECK_ERR(r);
   print_taskstats(outfd, &ts);
 
   r = waitpid(init_pid, NULL, 0); CHECK_ERR(r);
